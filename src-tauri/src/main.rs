@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod escpos;
+mod mcp;
 mod qr;
 mod sample;
 mod server;
@@ -12,6 +13,11 @@ use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
 fn main() {
     let (mut cfg, headless) = server::Config::from_args();
+
+    // MCP clients that only launch stdio servers: bridge to the running app's /mcp endpoint.
+    if std::env::args().any(|a| a == "--mcp-stdio") {
+        mcp::run_stdio_bridge(cfg.viewer_port);
+    }
 
     if headless {
         match server::start(cfg, false) {

@@ -29,6 +29,39 @@ Point your POS / app at this computer as a **network printer**: `<this computer'
 
 The viewer is also served at http://localhost:9101 (local only), so you can open it in a browser too.
 
+## Let AI agents read receipts (MCP)
+
+The app includes an [MCP](https://modelcontextprotocol.io) server at **`http://localhost:9101/mcp`** (also shown in the window header). AI agents can use it to read what your POS printed.
+It is local-only and works while the app (or `--headless`) is running.
+
+| Tool | What it does |
+|---|---|
+| `printer_status` | Printer port, LAN address, running or not, and the latest receipt id |
+| `list_receipts` | Recent receipts: id, time, source, size, first line |
+| `get_receipt` | One receipt (latest by default). `text` lays it out like the paper, with `[QR code: …]` / `[CODE128 barcode: …]` lines. `json` returns the structure with styles, `hex` the raw ESC/POS bytes |
+| `wait_for_receipt` | Blocks until the next receipt finishes printing, then returns it. Lets an agent trigger a print in your POS and check the result |
+| `clear_receipts` | Deletes all receipts |
+
+**Claude Code:**
+
+```bash
+claude mcp add --transport http escpos-printer http://localhost:9101/mcp
+```
+
+**Cursor / other clients with HTTP support:** `{ "mcpServers": { "escpos-printer": { "url": "http://localhost:9101/mcp" } } }`
+
+**Claude Desktop and other stdio-only clients:** run the app binary with `--mcp-stdio`. It forwards to the running app.
+
+```json
+{ "mcpServers": { "escpos-printer": {
+    "command": "/Applications/ESC POS Virtual Printer.app/Contents/MacOS/escpos-virtual-printer",
+    "args": ["--mcp-stdio"] } } }
+```
+
+On Windows the default install path is `%LOCALAPPDATA%\ESC POS Virtual Printer\escpos-virtual-printer.exe`.
+
+If port 9101 was taken when the app started, it picks another viewer port; check the window header. In that case use that URL, or `--mcp-stdio --viewer-port <n>`.
+
 ## What's supported
 
 - **Transport:** raw TCP (one or many receipts per connection, split on cut), plus HTTP `POST`/`PUT` of raw bytes to the same port with CORS + Private-Network headers (for web POS apps)

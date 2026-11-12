@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -36,7 +36,8 @@ pub const HELP: &str = "Usage: escpos-virtual-printer [options]
   --viewer-port <n>   web viewer port             (VIEWER_PORT, default 9101)
   --viewer-host <a>   web viewer bind address     (VIEWER_HOST, default 127.0.0.1)
   --save <dir>        save every job as .bin      (SAVE_DIR)
-  --chinese           decode non-UTF-8 text as GB18030 by default (CHINESE_MODE=1)";
+  --chinese           decode non-UTF-8 text as GB18030 by default (CHINESE_MODE=1)
+  --mcp-stdio         MCP stdio bridge to the running app's http://127.0.0.1:<viewer-port>/mcp";
 
 impl Config {
     /// Parse CLI flags (with env var fallbacks). Returns the config and whether to run headless.
@@ -94,6 +95,9 @@ pub struct Shared {
     log: Mutex<VecDeque<Value>>,
     clients: Mutex<Vec<TcpStream>>,
     status: Mutex<Status>,
+    /// Highest finished receipt id, signalled for MCP wait_for_receipt.
+    latest_done: Mutex<u64>,
+    done_cv: Condvar,
 }
 
 /// Start the viewer and (try to) start the printer port. A busy printer port is not
@@ -110,6 +114,8 @@ pub fn start(cfg: Config, viewer_fallback: bool) -> Result<Arc<Shared>, String> 
         receipts: Mutex::new(Vec::new()),
         log: Mutex::new(VecDeque::new()),
         clients: Mutex::new(Vec::new()),
+        latest_done: Mutex::new(0),
+        done_cv: Condvar::new(),
     });
 
     let s = shared.clone();
@@ -180,10 +186,56 @@ impl Shared {
     fn config_json(&self) -> Value {
         let st = self.status.lock().unwrap();
         json!({ "port": st.port, "host": self.cfg.host, "addresses": lan_address().into_iter().collect::<Vec<_>>(),
-            "chinese": self.cfg.chinese, "listening": st.listening, "error": st.error })
+            "chinese": self.cfg.chinese, "listening": st.listening, "error": st.error,
+            "mcp": format!("http://localhost:{}/mcp", self.viewer_port) })
+    }
+
+    // ------------------------------------------------------------------ accessors for MCP
+
+    pub fn status_json(&self) -> Value {
+        let mut v = self.config_json();
+        v["latest_receipt_id"] = json!(self.latest_done_id());
+        v["receipt_count"] = json!(self.receipts.lock().unwrap().len());
+        v["viewer"] = json!(format!("http://localhost:{}", self.viewer_port));
+        v
+    }
+
+    /// (id, receipt JSON) in arrival order.
+    pub fn receipts_json(&self) -> Vec<(u64, String)> {
+        self.receipts.lock().unwrap().iter().map(|r| (r.id, r.json.clone())).collect()
+    }
+
+    pub fn receipt_raw(&self, id: u64) -> Option<Vec<u8>> {
+        self.receipts.lock().unwrap().iter().find(|r| r.id == id && !r.raw.is_empty()).map(|r| r.raw.clone())
+    }
+
+    pub fn clear_receipts(&self) -> usize {
+        let n = {
+            let mut list = self.receipts.lock().unwrap();
+            let n = list.len();
+            list.clear();
+            n
+        };
+        self.broadcast("clear", "{}");
+        n
+    }
+
+    pub fn latest_done_id(&self) -> u64 {
+        *self.latest_done.lock().unwrap()
+    }
+
+    /// Block until a receipt with id > `after` is finished; returns its id.
+    pub fn wait_for_done(&self, after: u64, timeout: Duration) -> Option<u64> {
+        let guard = self.latest_done.lock().unwrap();
+        let (guard, _) = self.done_cv.wait_timeout_while(guard, timeout, |latest| *latest <= after).unwrap();
+        (*guard > after).then(|| {
+            // the first finished receipt after `after`, not necessarily the newest
+            self.receipts.lock().unwrap().iter().filter(|r| r.id > after && !r.raw.is_empty()).map(|r| r.id).min().unwrap_or(*guard)
+        })
     }
 
     fn upsert(&self, id: u64, json: String, raw: Option<Vec<u8>>) {
+        let done = raw.is_some();
         {
             let mut list = self.receipts.lock().unwrap();
             if let Some(r) = list.iter_mut().find(|r| r.id == id) {
@@ -197,6 +249,11 @@ impl Shared {
                     list.remove(0);
                 }
             }
+        }
+        if done {
+            let mut latest = self.latest_done.lock().unwrap();
+            *latest = (*latest).max(id);
+            self.done_cv.notify_all();
         }
         self.broadcast("receipt", &json);
     }
@@ -411,9 +468,27 @@ impl Shared {
                 }
             }
             ("POST", "/api/clear") => {
-                self.receipts.lock().unwrap().clear();
-                self.broadcast("clear", "{}");
+                self.clear_receipts();
                 json_reply(&mut stream, "200 OK", json!({ "ok": true }));
+            }
+            ("POST", "/mcp") => {
+                // DNS-rebinding guard (MCP spec): browsers send Origin; only accept local pages.
+                if let Some(origin) = req.header("origin") {
+                    let local = ["http://localhost", "http://127.0.0.1", "tauri://", "https://tauri.localhost"]
+                        .iter()
+                        .any(|p| origin.starts_with(p));
+                    if !local {
+                        return json_reply(&mut stream, "403 Forbidden", json!({ "error": "origin not allowed" }));
+                    }
+                }
+                let (status, body) = crate::mcp::handle(&self, &req.body);
+                match body {
+                    Some(b) => reply(&mut stream, status, "application/json", b.as_bytes(), &[]),
+                    None => reply(&mut stream, status, "application/json", b"", &[]),
+                }
+            }
+            ("GET", "/mcp") | ("DELETE", "/mcp") => {
+                reply(&mut stream, "405 Method Not Allowed", "application/json", b"", &[("Allow", "POST")])
             }
             ("POST", "/api/test") => {
                 let st = self.status.lock().unwrap();
@@ -452,7 +527,14 @@ impl Shared {
 struct Request {
     method: String,
     target: String,
+    headers: Vec<(String, String)>,
     body: Vec<u8>,
+}
+
+impl Request {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+    }
 }
 
 /// Read one HTTP/1.x request (headers + Content-Length body; without a length the body
@@ -476,10 +558,12 @@ fn read_request(stream: &mut TcpStream, mut buf: Vec<u8>) -> Option<Request> {
     let mut first = lines.next()?.split(' ');
     let method = first.next()?.to_string();
     let target = first.next()?.to_string();
-    let length = lines
-        .filter_map(|l| l.split_once(':'))
-        .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, v)| v.trim().parse::<usize>().ok());
+    let headers: Vec<(String, String)> =
+        lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_string(), v.trim().to_string())).collect();
+    let length = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, v)| v.parse::<usize>().ok());
     let mut body = buf[header_end + 4..].to_vec();
     let expects_body = matches!(method.as_str(), "POST" | "PUT");
     match length {
@@ -500,7 +584,7 @@ fn read_request(stream: &mut TcpStream, mut buf: Vec<u8>) -> Option<Request> {
         },
         None => {}
     }
-    Some(Request { method, target, body })
+    Some(Request { method, target, headers, body })
 }
 
 fn reply(stream: &mut TcpStream, status: &str, content_type: &str, body: &[u8], headers: &[(&str, &str)]) {

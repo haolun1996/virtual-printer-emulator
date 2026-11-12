@@ -61,6 +61,7 @@
   <h1>🖨 ESC/POS Virtual Printer</h1>
   <span><span id="dot" class="dot"></span><span id="status">connecting…</span></span>
   <span class="addr" id="addr"></span>
+  <button id="copyMcp" title="Copy the Claude Code command that connects an AI agent to this printer">Copy MCP command</button>
   <span class="spacer"></span>
   <label>Paper
     <select id="paper">
@@ -126,6 +127,35 @@ applySettings();
 $('paper').onchange = (e) => { settings.paper = localStorage.paper = e.target.value; applySettings(); };
 $('zoom').onchange = (e) => { settings.zoom = localStorage.zoom = e.target.value; applySettings(); };
 $('clear').onclick = () => fetch('/api/clear', { method: 'POST' });
+// Clipboard: async API first, then the legacy execCommand path (older WebKit webviews),
+// and as a last resort show the command selected so the user can press Cmd/Ctrl+C.
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    const ta = Object.assign(document.createElement('textarea'), { value: text });
+    ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0';
+    document.body.append(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch { /* not supported */ }
+    ta.remove();
+    return ok;
+  }
+}
+const mcpCommand = () => `claude mcp add --transport http escpos-printer ${state.config?.mcp || `${location.origin}/mcp`}`;
+$('copyMcp').onclick = async () => {
+  const cmd = mcpCommand();
+  const btn = $('copyMcp');
+  if (await copyText(cmd)) {
+    btn.textContent = 'Copied ✓';
+  } else {
+    window.prompt('Copy this command:', cmd);
+  }
+  clearTimeout(btn._t);
+  btn._t = setTimeout(() => { btn.textContent = 'Copy MCP command'; }, 1500);
+};
 $('test').onclick = () => fetch(`/api/test?cols=${Math.floor(Number(settings.paper) / 12)}`, { method: 'POST' });
 
 // ---------------------------------------------------------------- rendering
@@ -317,8 +347,10 @@ function applyConfig(c) {
   $('addr').textContent = c.listening
     ? `printer: ${['localhost', ...ips].map((ip) => `${ip}:${c.port}`).join(' · ')}`
     : 'printer: not listening';
+  $('addr').textContent += `  ·  MCP: ${c.mcp}`;
   $('howto').textContent = `# from this computer\nprintf '\\x1b@Hello\\n\\x1dV\\x00' | nc -w1 localhost ${c.port}\n\n` +
-    (ips.length ? `# from another device on the network\nprinter IP: ${ips[0]}   port: ${c.port}` : '');
+    (ips.length ? `# from another device on the network\nprinter IP: ${ips[0]}   port: ${c.port}\n\n` : '') +
+    `# let an AI agent read receipts (MCP)\nclaude mcp add --transport http escpos-printer ${c.mcp}`;
   // Printer port could not be opened (e.g. 9100 taken by Flutter DevTools): let the user pick another.
   $('banner').classList.toggle('show', !c.listening);
   $('bannerText').textContent = c.error || `The printer is not listening on port ${c.port}.`;

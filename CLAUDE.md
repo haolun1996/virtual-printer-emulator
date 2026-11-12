@@ -27,9 +27,14 @@ The `LNK4099 … libcmt.amd64.pdb` linker warning is harmless.
   - `on_download` saves `download .bin` files to `~/Downloads`.
 - `src-tauri/src/server.rs`: two servers.
   - **Printer port** (one thread per connection, 100 ms read timeout) sniffs the first bytes. HTTP verbs are handled as HTTP (POST body = raw ESC/POS, CORS + Private-Network headers). Anything else is fed into one `Printer`.
-  - **Viewer** (127.0.0.1) serves `ui/index.html` (embedded with `include_str!`), SSE at `/events` (`init`, `receipt`, `log`, `status`, `clear`) and `/api/receipts`, `/api/receipts/:id/raw`, `/api/clear`, `/api/test`, `/api/listen?port=`.
+  - **Viewer** (127.0.0.1) serves `ui/index.html` (embedded with `include_str!`), SSE at `/events` (`init`, `receipt`, `log`, `status`, `clear`), the MCP endpoint `/mcp`, and `/api/receipts`, `/api/receipts/:id/raw`, `/api/clear`, `/api/test`, `/api/listen?port=`.
   - If the viewer port is busy, the app picks a free one. A busy printer port is **not** fatal: `status.listening = false`, and the UI shows a banner to start on another port.
 - `src-tauri/src/escpos.rs`: parser and printer model (`Printer`, `Receipt`, `Item`). Pure, no I/O. Output is `printer.events`: `Update` (receipt JSON; `raw` attached once done), `Log`, `Respond` (bytes back to the client).
+- `src-tauri/src/mcp.rs`: MCP server, so AI agents can read receipts.
+  - Streamable HTTP at `POST /mcp` on the viewer server. Every request gets a plain JSON response; there is no server-initiated SSE stream, and `GET /mcp` returns 405. Requests with a non-local `Origin` get 403 (DNS-rebinding guard).
+  - Tools: `printer_status`, `list_receipts`, `get_receipt` (text/json/hex), `wait_for_receipt` (Condvar `latest_done` in `Shared`), `clear_receipts`.
+  - `render_receipt` turns the receipt JSON into plain text on N columns.
+  - `--mcp-stdio` (`run_stdio_bridge`) forwards newline-delimited JSON-RPC from stdin to the running app's `/mcp`.
 - `src-tauri/src/qr.rs`: QR encoder (byte mode, v1–40, L/M/Q/H, mask selection). `pack()` produces 1-bit rows.
 - `src-tauri/src/sample.rs`: the demo receipt behind the "Print test receipt" button.
 - `ui/index.html`: the viewer (inline CSS/JS). It renders the receipt JSON into DOM and canvas.
@@ -58,6 +63,10 @@ Units are printer dots, rendered at 1 dot = 1 CSS px. Font A is 12×24 dots, Fon
 - Text decoding order: ASCII → GB18030 when Chinese mode is on → strict UTF-8 → `ESC t` code page (`encoding_rs`) → CP437.
 - Watch for usize underflow when porting arithmetic: JS tolerated negative intermediates (this already bit `qr.rs`).
 
+## MCP output rule
+
+`get_receipt` text mirrors the paper: no extra commentary inside the ruled block. Images, barcodes and QR codes appear as single `[ … ]` lines that include their data, so agents can verify them.
+
 ## Viewer rule: the paper shows only what the printer would print
 
 Never add debug or helper text onto the paper (the user flagged a decoded-URL label under the QR as wrong).
@@ -69,6 +78,7 @@ Put metadata in the `.meta` bar above the receipt, in tooltips or in the Activit
   - `sample_receipt_chunked` feeds the sample in 1-, 7- and 4096-byte chunks and checks the per-receipt raw bytes add up.
   - `qr::matches_verified_reference` holds FNV hashes of matrices from an encoder whose output macOS CoreImage decoded, so any change to the QR output fails it.
 - **End to end:** run `cargo run -- --headless --port 19100 --viewer-port 19101`, send jobs with `nc`/`curl`, then check `curl localhost:19101/api/receipts`.
+- **MCP:** POST JSON-RPC with curl (`initialize`, `tools/list`, `tools/call`). To test with a real client without touching the user's config, use `claude -p "<prompt>" --strict-mcp-config --mcp-config <tmp.json> --allowedTools "mcp__escpos__get_receipt"`. Put the prompt **before** `--allowedTools`, which takes several values.
 - **Visual:** `"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --headless=new --disable-gpu --user-data-dir=<tmp> --window-size=1100,900 --screenshot=<out.png> http://localhost:19101/`
 - **QR scannability:** decode a screenshot with a `swift` script: `CIDetector(ofType: CIDetectorTypeQRCode)` → `CIQRCodeFeature.messageString`.
 
