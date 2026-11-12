@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESC/POS Virtual Printer</title>
+<style>
+  :root { --bg: #1d1f23; --panel: #26292e; --line: #34373d; --text: #e7e7e7; --muted: #9aa0a6; --ok: #3ccf7a; --bad: #ef5b5b; --accent: #5b8cff; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); display: flex; flex-direction: column; }
+  header { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--bad); display: inline-block; margin-right: 6px; }
+  .dot.on { background: var(--ok); }
+  .addr { color: var(--muted); font-family: Menlo, monospace; font-size: 12px; }
+  .spacer { flex: 1; }
+  select, button { background: #33363c; color: var(--text); border: 1px solid #44474e; border-radius: 6px; padding: 5px 10px; font: inherit; cursor: pointer; }
+  button:hover, select:hover { border-color: var(--accent); }
+  label { color: var(--muted); display: flex; gap: 6px; align-items: center; }
+  main { flex: 1; display: flex; min-height: 0; }
+  #receipts { flex: 1; overflow: auto; padding: 24px; display: flex; flex-direction: column; align-items: center; gap: 32px; }
+  #empty { color: var(--muted); text-align: center; margin-top: 12vh; max-width: 560px; }
+  #empty code { display: block; margin-top: 10px; background: #111; padding: 10px; border-radius: 6px; color: #cfe; text-align: left; white-space: pre-wrap; }
+  aside { width: 360px; border-left: 1px solid var(--line); display: flex; flex-direction: column; background: #202226; }
+  aside h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+  #log { flex: 1; overflow: auto; padding: 8px 12px; font: 11px/1.5 Menlo, monospace; color: #c9cdd2; }
+  #log .t { color: #6f757c; margin-right: 6px; }
+
+  .receipt { display: flex; flex-direction: column; align-items: center; }
+  .meta { font-size: 12px; color: var(--muted); margin-bottom: 8px; display: flex; gap: 10px; align-items: center; }
+  .meta a, .meta button { color: var(--accent); background: none; border: none; padding: 0; text-decoration: none; cursor: pointer; font-size: 12px; }
+  .meta .live { color: var(--ok); }
+  .paper { background: #fbfbf8; color: #141414; padding: 18px 16px 22px; box-shadow: 0 3px 14px rgba(0,0,0,.55); zoom: var(--zoom, 1);
+           font-family: Menlo, "SF Mono", Monaco, Consolas, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", monospace; }
+  .content { width: calc(var(--dots) * 1px + 1px); overflow: hidden; }
+  .line { white-space: pre-wrap; word-break: break-all; overflow-wrap: anywhere; }
+  .line span { vertical-align: baseline; }
+  .line .sp { display: inline-block; height: 1px; }
+  .line .stretch { display: inline-block; white-space: pre; }
+  .line .stretch > span { display: inline-block; transform-origin: left center; white-space: pre; }
+  .img { line-height: 0; font-size: 0; }
+  .img canvas { image-rendering: pixelated; vertical-align: top; }
+  .code { display: flex; flex-direction: column; }
+  .code .box { border: 2px dashed #777; color: #555; display: flex; align-items: center; justify-content: center; font: 600 13px -apple-system, sans-serif; text-align: center; padding: 4px; }
+  .code .hri { font-size: 15px; text-align: center; margin: 2px 0; word-break: break-all; }
+  .code .data { font: 11px Menlo, monospace; color: #555; word-break: break-all; text-align: center; margin-top: 4px; max-width: 100%; }
+  .code canvas.qr { image-rendering: pixelated; }
+  .note { color: #777; font-style: italic; font-size: 14px; text-align: center; padding: 4px 0; }
+  .cut { margin-top: 10px; border-top: 2px dashed #b5b5b5; text-align: center; font-size: 13px; color: #999; line-height: 1; }
+  .cut::before { content: "✂"; position: relative; top: -9px; background: #fbfbf8; padding: 0 6px; }
+  .hex { max-width: 760px; max-height: 320px; overflow: auto; background: #111; color: #bfe0c8; font: 11px/1.45 Menlo, monospace; padding: 10px; border-radius: 6px; margin-top: 10px; white-space: pre; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🖨 ESC/POS Virtual Printer</h1>
+  <span><span id="dot" class="dot"></span><span id="status">connecting…</span></span>
+  <span class="addr" id="addr"></span>
+  <span class="spacer"></span>
+  <label>Paper
+    <select id="paper">
+      <option value="384">58 mm (384 dots · 32 cols)</option>
+      <option value="512">80 mm (512 dots · 42 cols)</option>
+      <option value="576">80 mm (576 dots · 48 cols)</option>
+    </select>
+  </label>
+  <label>Zoom
+    <select id="zoom">
+      <option value="0.75">75%</option><option value="1">100%</option><option value="1.25">125%</option><option value="1.5">150%</option>
+    </select>
+  </label>
+  <button id="test">Print test receipt</button>
+  <button id="clear">Clear</button>
+</header>
+<main>
+  <section id="receipts">
+    <div id="empty">
+      <p><b>Waiting for print jobs…</b></p>
+      <p>Point your POS / app at this Mac as a <b>network (RAW / JetDirect) printer, port 9100</b>.</p>
+      <code id="howto"></code>
+    </div>
+  </section>
+  <aside>
+    <h2>Activity</h2>
+    <div id="log"></div>
+  </aside>
+</main>
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+const el = (tag, cls) => { const e = document.createElement(tag); if (cls) e.className = cls; return e; };
+
+// Font A = 12x24 dots, Font B = 9x17 dots; 1 dot = 1 CSS px. Font size is derived from the
+// actual advance width of the monospace font so 48 Font-A chars span exactly 576 px.
+const FONT = { A: { w: 12, h: 24 }, B: { w: 9, h: 17 } };
+(function calibrate() {
+  const ctx = document.createElement('canvas').getContext('2d');
+  ctx.font = `100px ${getComputedStyle(document.documentElement).getPropertyValue('--mono') || 'Menlo, "SF Mono", Monaco, Consolas, monospace'}`;
+  const ratio = ctx.measureText('M'.repeat(10)).width / 1000 || 0.6;
+  for (const f of Object.values(FONT)) f.size = f.w / ratio;
+})();
+
+const isWide = (cp) => cp >= 0x1100 && (cp <= 0x115f || (cp >= 0x2e80 && cp <= 0xa4cf) || (cp >= 0xac00 && cp <= 0xd7a3) ||
+  (cp >= 0xf900 && cp <= 0xfaff) || (cp >= 0xfe30 && cp <= 0xfe4f) || (cp >= 0xff00 && cp <= 0xff60) || (cp >= 0xffe0 && cp <= 0xffe6) || cp >= 0x20000);
+const cols = (t) => { let n = 0; for (const c of t) n += isWide(c.codePointAt(0)) ? 2 : 1; return n; };
+
+const state = { receipts: new Map(), config: null };
+const settings = { paper: localStorage.paper || '576', zoom: localStorage.zoom || '1' };
+$('paper').value = settings.paper; $('zoom').value = settings.zoom;
+const applySettings = () => {
+  document.documentElement.style.setProperty('--dots', settings.paper);
+  document.documentElement.style.setProperty('--zoom', settings.zoom);
+};
+applySettings();
+$('paper').onchange = (e) => { settings.paper = localStorage.paper = e.target.value; applySettings(); };
+$('zoom').onchange = (e) => { settings.zoom = localStorage.zoom = e.target.value; applySettings(); };
+$('clear').onclick = () => fetch('/api/clear', { method: 'POST' });
+$('test').onclick = () => fetch(`/api/test?cols=${Math.floor(Number(settings.paper) / 12)}`, { method: 'POST' });
+
+// ---------------------------------------------------------------- rendering
+
+function renderText(it) {
+  const div = el('div', 'line');
+  div.style.textAlign = it.align || 'left';
+  if (it.margin) div.style.paddingLeft = it.margin + 'px';
+  let maxH = 0;
+  for (const s of it.spans) {
+    if (s.sp !== undefined) { const g = el('span', 'sp'); g.style.width = s.sp + 'px'; div.append(g); continue; }
+    if (!s.t) continue;
+    const F = FONT[s.f] || FONT.A, w = s.w || 1, h = s.h || 1;
+    maxH = Math.max(maxH, F.h * h);
+    const span = el('span');
+    span.textContent = s.t;
+    span.style.fontSize = F.size * h + 'px';
+    if (s.b) span.style.fontWeight = '700';
+    if (s.i) span.style.fontStyle = 'italic';
+    if (s.u) { span.style.textDecoration = 'underline'; span.style.textDecorationThickness = s.u === 2 ? '2px' : '1px'; }
+    if (s.inv) { span.style.background = '#141414'; span.style.color = '#fbfbf8'; }
+    if (s.cs) span.style.letterSpacing = (s.cs * w) / (w / h) + 'px';
+    if (w !== h) {
+      const box = el('span', 'stretch');
+      box.style.width = (cols(s.t) * F.w + (s.cs || 0)) * w + 'px';
+      span.style.transform = `scaleX(${w / h})`;
+      box.append(span);
+      div.append(box);
+    } else {
+      div.append(span);
+    }
+  }
+  const lh = Math.max(it.spacing ?? 30, maxH || FONT.A.h);
+  div.style.lineHeight = lh + 'px';
+  div.style.minHeight = lh + 'px';
+  return div;
+}
+
+function renderImage(it) {
+  const wrap = el('div', 'img');
+  wrap.style.textAlign = it.align || 'left';
+  const c = el('canvas');
+  c.width = it.w; c.height = it.h;
+  const ctx = c.getContext('2d');
+  const img = ctx.createImageData(it.w, it.h);
+  const bytes = Uint8Array.from(atob(it.data), (ch) => ch.charCodeAt(0));
+  const bpr = Math.ceil(it.w / 8);
+  for (let y = 0; y < it.h; y++) {
+    for (let x = 0; x < it.w; x++) {
+      if (bytes[y * bpr + (x >> 3)] & (0x80 >> (x & 7))) {
+        const o = (y * it.w + x) * 4;
+        img.data[o] = img.data[o + 1] = img.data[o + 2] = 20;
+        img.data[o + 3] = 255;
+      }
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  c.style.width = it.w * (it.sx || 1) + 'px';
+  c.style.height = it.h * (it.sy || 1) + 'px';
+  wrap.append(c);
+  return wrap;
+}
+
+function renderCode(it) {
+  const wrap = el('div', 'code');
+  wrap.style.alignItems = { center: 'center', right: 'flex-end' }[it.align] || 'flex-start';
+  const box = el('div', 'box');
+  const hri = (pos) => { if (it.type === 'barcode' && (it.hri === pos || it.hri === 3)) { const t = el('div', 'hri'); t.textContent = it.data; wrap.append(t); } };
+  if (it.type === 'barcode') {
+    box.style.width = Math.min(Number(settings.paper) - 20, 60 + it.data.length * 11 * Math.max(1, it.module / 2)) + 'px';
+    box.style.height = Math.min(it.height, 200) + 'px';
+    box.textContent = `${it.kind} barcode`;
+  } else if (it.matrix) {
+    // Real QR symbol: modules × module-size dots, like the printer would print it.
+    const c = el('canvas', 'qr');
+    c.width = c.height = it.modules;
+    const ctx = c.getContext('2d');
+    const bytes = Uint8Array.from(atob(it.matrix), (ch) => ch.charCodeAt(0));
+    const bpr = Math.ceil(it.modules / 8);
+    ctx.fillStyle = '#141414';
+    for (let y = 0; y < it.modules; y++) {
+      for (let x = 0; x < it.modules; x++) if (bytes[y * bpr + (x >> 3)] & (0x80 >> (x & 7))) ctx.fillRect(x, y, 1, 1);
+    }
+    const side = it.modules * Math.max(1, it.size || 3);
+    c.style.width = c.style.height = side + 'px';
+    // Keep the paper faithful to what the printer would print: the encoded data is
+    // only shown on hover, and a URL opens on click.
+    c.title = `${it.data}\n\nQR · module ${it.size} dots · EC ${it.ec}${/^https?:\/\//.test(it.data) ? ' · click to open' : ''}`;
+    if (/^https?:\/\/\S+$/.test(it.data)) {
+      c.style.cursor = 'pointer';
+      c.onclick = () => window.open(it.data, '_blank', 'noopener');
+    }
+    wrap.append(c);
+    return wrap;
+  } else {
+    const side = Math.min(Number(settings.paper) - 20, 25 * (it.size || 3) + 40);
+    box.style.width = box.style.height = side + 'px';
+    box.textContent = it.kind === 'QR' ? `QR code\n(size ${it.size}, EC ${it.ec})` : `${it.kind}`;
+    box.style.whiteSpace = 'pre';
+  }
+  box.title = 'Placeholder: the symbol is not drawn, the encoded data is shown below/above it';
+  hri(1);
+  wrap.append(box);
+  hri(2);
+  if (it.type !== 'barcode' || !it.hri) { const d = el('div', 'data'); d.textContent = it.data; wrap.append(d); }
+  return wrap;
+}
+
+function renderItem(it) {
+  switch (it.type) {
+    case 'text': return renderText(it);
+    case 'image': return renderImage(it);
+    case 'barcode': case 'code2d': return renderCode(it);
+    case 'feed': { const d = el('div'); d.style.height = it.dots + 'px'; return d; }
+    case 'note': { const d = el('div', 'note'); d.textContent = it.text; return d; }
+    default: return el('div');
+  }
+}
+
+function hexDump(buf) {
+  const lines = [];
+  for (let o = 0; o < buf.length; o += 16) {
+    const row = buf.subarray(o, o + 16);
+    const hex = [...row].map((b) => b.toString(16).padStart(2, '0')).join(' ');
+    const asc = [...row].map((b) => (b >= 0x20 && b < 0x7f ? String.fromCharCode(b) : '.')).join('');
+    lines.push(`${o.toString(16).padStart(6, '0')}  ${hex.padEnd(47)}  ${asc}`);
+  }
+  return lines.join('\n') || '(empty)';
+}
+
+function renderReceipt(r) {
+  let node = state.receipts.get(r.id)?.node;
+  if (!node) {
+    node = el('div', 'receipt');
+    $('receipts').prepend(node);
+  }
+  state.receipts.set(r.id, { data: r, node });
+  $('empty').style.display = 'none';
+
+  const meta = el('div', 'meta');
+  const time = new Date(r.createdAt).toLocaleTimeString();
+  meta.append(Object.assign(el('span'), { textContent: `#${r.id} · ${time} · ${r.remote} · ${r.source.toUpperCase()} · ${r.bytes.toLocaleString()} bytes` }));
+  if (!r.done) meta.append(Object.assign(el('span', 'live'), { textContent: '● receiving' }));
+  const raw = Object.assign(el('a'), { href: `/api/receipts/${r.id}/raw`, textContent: 'download .bin' });
+  const hexBtn = Object.assign(el('button'), { textContent: 'hex' });
+  meta.append(raw, hexBtn);
+
+  const paper = el('div', 'paper');
+  const content = el('div', 'content');
+  for (const it of r.items) content.append(renderItem(it));
+  if (r.cut) content.append(el('div', 'cut'));
+  paper.append(content);
+
+  const prevHex = node.querySelector('.hex');
+  node.replaceChildren(meta, paper);
+  if (prevHex) node.append(prevHex);
+  hexBtn.onclick = async () => {
+    const existing = node.querySelector('.hex');
+    if (existing) return existing.remove();
+    const buf = new Uint8Array(await (await fetch(raw.href)).arrayBuffer());
+    node.append(Object.assign(el('div', 'hex'), { textContent: hexDump(buf) }));
+  };
+}
+
+function addLog({ t, msg }) {
+  const log = $('log');
+  const stick = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+  const line = el('div');
+  line.append(Object.assign(el('span', 't'), { textContent: new Date(t).toLocaleTimeString() }), msg);
+  log.append(line);
+  while (log.childElementCount > 500) log.firstChild.remove();
+  if (stick) log.scrollTop = log.scrollHeight;
+}
+
+function resetView() {
+  for (const { node } of state.receipts.values()) node.remove();
+  state.receipts.clear();
+  $('empty').style.display = '';
+}
+
+// ---------------------------------------------------------------- live updates
+
+const es = new EventSource('/events');
+es.onopen = () => { $('dot').classList.add('on'); $('status').textContent = 'connected'; };
+es.onerror = () => { $('dot').classList.remove('on'); $('status').textContent = 'viewer disconnected (is the server running?)'; };
+es.addEventListener('init', (e) => {
+  const d = JSON.parse(e.data);
+  state.config = d.config;
+  resetView();
+  $('log').replaceChildren();
+  d.receipts.forEach(renderReceipt);
+  d.log.forEach(addLog);
+  const ips = d.config.host === '0.0.0.0' ? d.config.addresses : [d.config.host];
+  $('addr').textContent = `printer: ${['localhost', ...ips].map((ip) => `${ip}:${d.config.port}`).join(' · ')}`;
+  $('howto').textContent = `# from this Mac\nprintf '\\x1b@Hello\\n\\x1dV\\x00' | nc -w1 localhost ${d.config.port}\n\n` +
+    (ips.length ? `# from another device on the network\nprinter IP: ${ips[0]}   port: ${d.config.port}` : '');
+});
+es.addEventListener('receipt', (e) => renderReceipt(JSON.parse(e.data)));
+es.addEventListener('log', (e) => addLog(JSON.parse(e.data)));
+es.addEventListener('clear', resetView);
+</script>
+</body>
+</html>
