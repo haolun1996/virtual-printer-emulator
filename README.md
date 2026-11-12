@@ -1,44 +1,33 @@
-# ESC/POS Virtual Printer (macOS)
+# ESC/POS Virtual Printer
 
-A virtual thermal receipt printer that listens on **TCP port 9100** (RAW / JetDirect) and shows
-every print job live in your browser. Pure Node.js, **no dependencies**, no build step.
-Inspired by [Garletz/escpos-virtual-printer-emulator](https://github.com/Garletz/escpos-virtual-printer-emulator) (Rust/egui, Windows/Linux).
+A virtual thermal receipt printer for **macOS and Windows**. It listens on **TCP port 9100** (RAW / JetDirect), like a network receipt printer, and shows every print job live in its window.
+Built with Rust + [Tauri](https://tauri.app): a ~3 MB native app with nothing else to install.
+Inspired by [Garletz/escpos-virtual-printer-emulator](https://github.com/Garletz/escpos-virtual-printer-emulator).
 
-## Run
+## Install
 
-```bash
-node server.js --open        # or: npm start
-```
+| Platform | File (from `src-tauri/target/…/bundle/`) |
+|---|---|
+| macOS (Apple Silicon) | `dmg/ESC POS Virtual Printer_1.0.0_aarch64.dmg` |
+| Windows (x64) | `nsis/ESC POS Virtual Printer_1.0.0_x64-setup.exe` |
 
-- Printer: `tcp://<your-mac-ip>:9100` (listens on all interfaces, so tablets/POS terminals on your LAN can print)
-- Viewer: http://localhost:9101 (bound to localhost only)
+The builds are **not code-signed**, so each OS warns the first time you open them:
 
-macOS may ask once whether `node` may accept incoming connections. Allow it if other devices need to print.
+- **macOS:** right-click the app, choose **Open**, then confirm. If macOS says the app "is damaged", run `xattr -dr com.apple.quarantine "/Applications/ESC POS Virtual Printer.app"`.
+- **Windows:** in the SmartScreen dialog, click **More info**, then **Run anyway**.
 
-> **Port 9100 busy?** Flutter/Dart DevTools also defaults to 9100. Check with
-> `lsof -nP -iTCP:9100 -sTCP:LISTEN`, then quit it or run the printer on another port: `node server.js --port 9200`.
+Allow incoming connections when the firewall asks, so tablets and POS terminals on your network can print to it.
 
-## Test it
+## Use
 
-```bash
-printf '\x1b@Hello from macOS\n\x1dV\x00' | nc -w1 localhost 9100
-node examples/test-print.js                 # full sample receipt (+ status query)
-node examples/test-print.js 192.168.1.20 9100 32   # remote host, 58mm (32 cols)
-```
+Point your POS / app at this computer as a **network printer**: `<this computer's IP>:9100`. The window shows the IP.
 
-Or click **Print test receipt** in the viewer.
+- **Port 9100 busy?** Flutter/Dart DevTools also uses 9100 by default. The app shows a banner where you can start the printer on another port, and it remembers that port.
+- **Test it:** click **Print test receipt**, or run `printf '\x1b@Hello\n\x1dV\x00' | nc -w1 localhost 9100`.
+- **Download a job:** **download .bin** saves the raw bytes of a receipt to your Downloads folder.
+- **Open a QR link:** click a QR code to open its URL in your browser.
 
-## Options
-
-| Flag | Env | Default | |
-|---|---|---|---|
-| `--port` | `PORT` | `9100` | printer port |
-| `--host` | `HOST` | `0.0.0.0` | use `127.0.0.1` to accept local jobs only |
-| `--viewer-port` | `VIEWER_PORT` | `9101` | web viewer |
-| `--viewer-host` | `VIEWER_HOST` | `127.0.0.1` | `0.0.0.0` to view from other devices |
-| `--save <dir>` | `SAVE_DIR` | off | save each job as a raw `.bin` |
-| `--chinese` | `CHINESE_MODE=1` | off | decode non-UTF-8 text as GB18030 (like Chinese-market printers with Chinese mode on by default) |
-| `--open` | `OPEN=1` | off | open the viewer in your browser |
+The viewer is also served at http://localhost:9101 (local only), so you can open it in a browser too.
 
 ## What's supported
 
@@ -50,7 +39,37 @@ Or click **Print test receipt** in the viewer.
 - **QR codes:** `GS ( k` QR codes are **drawn for real** (scannable from the screen) at the requested module size and error-correction level. Nothing extra is printed on the paper: hover the QR to see its data, click it to open a URL.
 - **Other barcodes:** `GS k` (all 1D types) and PDF417/DataMatrix/Aztec are **shown as labelled placeholders with the decoded data**; their bars/modules are not drawn.
 - **Cut:** `GS V`, `ESC i`, `ESC m`. **Drawer kick** `ESC p` is accepted.
-- Viewer: 58mm/80mm paper, zoom, per-receipt hex dump and raw `.bin` download, activity log
+- **Viewer:** 58mm/80mm paper, zoom, per-receipt hex dump and raw `.bin` download, activity log
+
+## Command line / headless
+
+The app binary also runs without a window (for example on a server):
+
+```bash
+escpos-virtual-printer --headless [--port 9100] [--host 0.0.0.0] [--viewer-port 9101] [--viewer-host 127.0.0.1] [--save <dir>] [--chinese]
+```
+
+Each flag also has an env var: `PORT`, `HOST`, `VIEWER_PORT`, `VIEWER_HOST`, `SAVE_DIR`, `CHINESE_MODE=1`, `HEADLESS=1`.
+
+- `--chinese` decodes non-UTF-8 text as GB18030, like Chinese-market printers that have Chinese mode on by default.
+- `--save` writes every job to `<dir>` as a raw `.bin` file.
+
+On macOS the binary is at `ESC POS Virtual Printer.app/Contents/MacOS/escpos-virtual-printer`.
+
+## Build from source
+
+Requires Rust and the Tauri CLI (`cargo install tauri-cli`).
+
+```bash
+cd src-tauri
+cargo test                                   # parser + QR known-answer tests
+cargo run -- --headless --port 19100         # dev run without a window
+cargo tauri dev                              # dev run with the window
+cargo tauri build --bundles app,dmg          # macOS .app + .dmg
+
+# Windows installer, cross-compiled on a Mac (needs `brew install llvm nsis` and `cargo install cargo-xwin`)
+PATH="/opt/homebrew/opt/llvm/bin:$PATH" cargo tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc --bundles nsis
+```
 
 ## Printing from Mac apps (optional)
 

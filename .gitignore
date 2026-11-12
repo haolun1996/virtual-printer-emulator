@@ -1,3 +1,5 @@
 node_modules/
 jobs/
 .DS_Store
+src-tauri/target/
+src-tauri/gen/

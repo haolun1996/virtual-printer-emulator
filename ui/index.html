@@ -17,8 +17,12 @@
   .spacer { flex: 1; }
   select, button { background: #33363c; color: var(--text); border: 1px solid #44474e; border-radius: 6px; padding: 5px 10px; font: inherit; cursor: pointer; }
   button:hover, select:hover { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: not-allowed; border-color: #44474e; }
   label { color: var(--muted); display: flex; gap: 6px; align-items: center; }
   main { flex: 1; display: flex; min-height: 0; }
+  #banner { display: none; gap: 10px; align-items: center; flex-wrap: wrap; padding: 10px 16px; background: #4a2323; border-bottom: 1px solid #7a3434; color: #ffdede; }
+  #banner.show { display: flex; }
+  #banner input { width: 80px; background: #2b1717; color: #fff; border: 1px solid #7a3434; border-radius: 6px; padding: 5px 8px; font: inherit; }
   #receipts { flex: 1; overflow: auto; padding: 24px; display: flex; flex-direction: column; align-items: center; gap: 32px; }
   #empty { color: var(--muted); text-align: center; margin-top: 12vh; max-width: 560px; }
   #empty code { display: block; margin-top: 10px; background: #111; padding: 10px; border-radius: 6px; color: #cfe; text-align: left; white-space: pre-wrap; }
@@ -73,6 +77,12 @@
   <button id="test">Print test receipt</button>
   <button id="clear">Clear</button>
 </header>
+<div id="banner">
+  <span id="bannerText"></span>
+  <span class="spacer"></span>
+  <label style="color:#ffdede">Use port <input id="portInput" type="number" min="1" max="65535"></label>
+  <button id="listenBtn">Start printer</button>
+</div>
 <main>
   <section id="receipts">
     <div id="empty">
@@ -259,7 +269,7 @@ function renderReceipt(r) {
   const time = new Date(r.createdAt).toLocaleTimeString();
   meta.append(Object.assign(el('span'), { textContent: `#${r.id} · ${time} · ${r.remote} · ${r.source.toUpperCase()} · ${r.bytes.toLocaleString()} bytes` }));
   if (!r.done) meta.append(Object.assign(el('span', 'live'), { textContent: '● receiving' }));
-  const raw = Object.assign(el('a'), { href: `/api/receipts/${r.id}/raw`, textContent: 'download .bin' });
+  const raw = Object.assign(el('a'), { href: `/api/receipts/${r.id}/raw`, textContent: 'download .bin', download: `receipt-${r.id}.bin` });
   const hexBtn = Object.assign(el('button'), { textContent: 'hex' });
   meta.append(raw, hexBtn);
 
@@ -301,18 +311,34 @@ function resetView() {
 const es = new EventSource('/events');
 es.onopen = () => { $('dot').classList.add('on'); $('status').textContent = 'connected'; };
 es.onerror = () => { $('dot').classList.remove('on'); $('status').textContent = 'viewer disconnected (is the server running?)'; };
+function applyConfig(c) {
+  state.config = c;
+  const ips = c.host === '0.0.0.0' ? c.addresses : [c.host];
+  $('addr').textContent = c.listening
+    ? `printer: ${['localhost', ...ips].map((ip) => `${ip}:${c.port}`).join(' · ')}`
+    : 'printer: not listening';
+  $('howto').textContent = `# from this computer\nprintf '\\x1b@Hello\\n\\x1dV\\x00' | nc -w1 localhost ${c.port}\n\n` +
+    (ips.length ? `# from another device on the network\nprinter IP: ${ips[0]}   port: ${c.port}` : '');
+  // Printer port could not be opened (e.g. 9100 taken by Flutter DevTools): let the user pick another.
+  $('banner').classList.toggle('show', !c.listening);
+  $('bannerText').textContent = c.error || `The printer is not listening on port ${c.port}.`;
+  if (!c.listening && !$('portInput').value) $('portInput').value = c.port === 9100 ? 9200 : c.port;
+  $('test').disabled = !c.listening;
+}
+$('listenBtn').onclick = async () => {
+  const res = await fetch(`/api/listen?port=${encodeURIComponent($('portInput').value)}`, { method: 'POST' });
+  if (!res.ok) $('bannerText').textContent = (await res.json()).error;
+};
+
 es.addEventListener('init', (e) => {
   const d = JSON.parse(e.data);
-  state.config = d.config;
   resetView();
   $('log').replaceChildren();
   d.receipts.forEach(renderReceipt);
   d.log.forEach(addLog);
-  const ips = d.config.host === '0.0.0.0' ? d.config.addresses : [d.config.host];
-  $('addr').textContent = `printer: ${['localhost', ...ips].map((ip) => `${ip}:${d.config.port}`).join(' · ')}`;
-  $('howto').textContent = `# from this Mac\nprintf '\\x1b@Hello\\n\\x1dV\\x00' | nc -w1 localhost ${d.config.port}\n\n` +
-    (ips.length ? `# from another device on the network\nprinter IP: ${ips[0]}   port: ${d.config.port}` : '');
+  applyConfig(d.config);
 });
+es.addEventListener('status', (e) => applyConfig(JSON.parse(e.data)));
 es.addEventListener('receipt', (e) => renderReceipt(JSON.parse(e.data)));
 es.addEventListener('log', (e) => addLog(JSON.parse(e.data)));
 es.addEventListener('clear', resetView);
