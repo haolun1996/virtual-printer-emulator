@@ -152,6 +152,31 @@ pub fn base64(data: &[u8]) -> String {
     out
 }
 
+/// Standard base64 (padding optional). `None` on any character outside the alphabet.
+pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim_end_matches('=').as_bytes();
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for &c in s {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
 // ------------------------------------------------------------------ model
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1157,5 +1182,15 @@ mod tests {
         assert_eq!(decode_text(&[0x80, 0x9c], 0, false), "Ç£"); // CP437
         assert_eq!(decode_text(&[0x80], 16, false), "€"); // WPC1252
         assert_eq!(base64(b"hello!?"), "aGVsbG8hPw==");
+    }
+
+    #[test]
+    fn base64_roundtrip() {
+        for n in 0..70u8 {
+            let data: Vec<u8> = (0..n).map(|i| i.wrapping_mul(37).wrapping_add(n)).collect();
+            assert_eq!(base64_decode(&base64(&data)).as_deref(), Some(&data[..]));
+        }
+        assert_eq!(base64_decode("aGVsbG8hPw").as_deref(), Some(&b"hello!?"[..]));
+        assert_eq!(base64_decode("a$=="), None);
     }
 }

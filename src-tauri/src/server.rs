@@ -1,13 +1,18 @@
 //! Two servers in one process, std-only (no async runtime):
 //!   - printer port (default 9100): raw TCP ESC/POS, or HTTP POST of raw bytes (CORS enabled)
 //!   - viewer (default 127.0.0.1:9101): ui/index.html, SSE live updates at /events, small JSON API
+//!
+//! Receipt images for MCP are captured by an open viewer (the window or a browser tab): the
+//! server sends a `capture` SSE event, the page renders the paper to PNG and posts it back to
+//! `/api/capture`, and the PNGs are written to a temp folder.
 
-use crate::escpos::{now_ms, Event, Printer};
+use crate::escpos::{base64_decode, now_ms, Event, Printer};
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -16,6 +21,10 @@ const INDEX_HTML: &str = include_str!("../../ui/index.html");
 const MAX_RECEIPTS: usize = 200;
 const MAX_LOG: usize = 500;
 const EMIT_EVERY: Duration = Duration::from_millis(100);
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// PNG pages for one capture request, or the viewer's error message.
+type CaptureResult = Result<Vec<Vec<u8>>, String>;
 
 #[derive(Clone)]
 pub struct Config {
@@ -98,6 +107,10 @@ pub struct Shared {
     /// Highest finished receipt id, signalled for MCP wait_for_receipt.
     latest_done: Mutex<u64>,
     done_cv: Condvar,
+    /// Image captures waiting for a viewer to answer: request id → result once posted.
+    captures: Mutex<HashMap<u64, Option<CaptureResult>>>,
+    capture_cv: Condvar,
+    next_capture: AtomicU64,
 }
 
 /// Start the viewer and (try to) start the printer port. A busy printer port is not
@@ -116,6 +129,9 @@ pub fn start(cfg: Config, viewer_fallback: bool) -> Result<Arc<Shared>, String> 
         clients: Mutex::new(Vec::new()),
         latest_done: Mutex::new(0),
         done_cv: Condvar::new(),
+        captures: Mutex::new(HashMap::new()),
+        capture_cv: Condvar::new(),
+        next_capture: AtomicU64::new(1),
     });
 
     let s = shared.clone();
@@ -216,8 +232,93 @@ impl Shared {
             list.clear();
             n
         };
+        let _ = std::fs::remove_dir_all(self.image_dir());
         self.broadcast("clear", "{}");
         n
+    }
+
+    /// Where receipt PNGs go. Per viewer port, so two running instances don't overwrite each other.
+    pub fn image_dir(&self) -> PathBuf {
+        std::env::temp_dir().join(format!("escpos-printer-{}", self.viewer_port))
+    }
+
+    /// Ask an open viewer to render receipt `id` and save it as PNG file(s), one per page.
+    pub fn capture_receipt(&self, id: u64) -> Result<Vec<PathBuf>, String> {
+        let json = self.receipts.lock().unwrap().iter().find(|r| r.id == id).map(|r| r.json.clone());
+        let json = json.ok_or_else(|| format!("No receipt #{id} (it may have been cleared)."))?;
+        let no_viewer = || {
+            format!("No viewer is open to render the image. Open the app window or http://localhost:{} in a browser, then try again.", self.viewer_port)
+        };
+        let req = self.next_capture.fetch_add(1, Ordering::Relaxed);
+        self.captures.lock().unwrap().insert(req, None);
+        self.broadcast("capture", &format!("{{\"req\":{req},\"receipt\":{json}}}"));
+        // broadcast drops dead connections, so an empty list now means nobody can answer
+        if self.clients.lock().unwrap().is_empty() {
+            self.captures.lock().unwrap().remove(&req);
+            return Err(no_viewer());
+        }
+        let guard = self.captures.lock().unwrap();
+        let (mut guard, _) = self
+            .capture_cv
+            .wait_timeout_while(guard, CAPTURE_TIMEOUT, |m| matches!(m.get(&req), Some(None)))
+            .unwrap();
+        let pages = match guard.remove(&req).flatten() {
+            Some(Ok(pages)) if !pages.is_empty() => pages,
+            Some(Ok(_)) => return Err("The viewer returned no image.".into()),
+            Some(Err(e)) => return Err(format!("The viewer could not render the receipt: {e}")),
+            None => {
+                return Err(format!(
+                    "No open viewer answered within {} s. Make sure the app window is open and not minimized, or reload http://localhost:{} if it was opened before this app version.",
+                    CAPTURE_TIMEOUT.as_secs(),
+                    self.viewer_port
+                ))
+            }
+        };
+        drop(guard);
+
+        let dir = self.image_dir();
+        std::fs::create_dir_all(&dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+        // drop earlier captures of this receipt ("receipt-1." / "receipt-1-p2." but not "receipt-12.")
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            let (a, b) = (format!("receipt-{id}."), format!("receipt-{id}-"));
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with(&a) || name.starts_with(&b) {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+        let n = pages.len();
+        let mut paths = Vec::with_capacity(n);
+        for (i, png) in pages.iter().enumerate() {
+            let name = if n == 1 { format!("receipt-{id}.png") } else { format!("receipt-{id}-p{}.png", i + 1) };
+            let path = dir.join(name);
+            std::fs::write(&path, png).map_err(|e| format!("could not write {}: {e}", path.display()))?;
+            paths.push(path);
+        }
+        Ok(paths)
+    }
+
+    /// A viewer's answer to a `capture` event: `{ req, pages: [base64 PNG], error? }`.
+    fn finish_capture(&self, body: &[u8]) -> bool {
+        let Ok(v) = serde_json::from_slice::<Value>(body) else { return false };
+        let Some(req) = v["req"].as_u64() else { return false };
+        let result: CaptureResult = match v["error"].as_str() {
+            Some(e) => Err(e.to_string()),
+            None => v["pages"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|p| p.as_str().and_then(base64_decode)).filter(|b| b.starts_with(b"\x89PNG")).collect())
+                .ok_or_else(|| "malformed capture".to_string()),
+        };
+        let mut map = self.captures.lock().unwrap();
+        match map.get_mut(&req) {
+            Some(slot @ None) => {
+                *slot = Some(result);
+                self.capture_cv.notify_all();
+                true
+            }
+            _ => false, // unknown, timed out, or another viewer answered first
+        }
     }
 
     pub fn latest_done_id(&self) -> u64 {
@@ -471,15 +572,20 @@ impl Shared {
                 self.clear_receipts();
                 json_reply(&mut stream, "200 OK", json!({ "ok": true }));
             }
+            ("POST", "/api/capture") => {
+                if !req.local_origin() {
+                    return json_reply(&mut stream, "403 Forbidden", json!({ "error": "origin not allowed" }));
+                }
+                if self.finish_capture(&req.body) {
+                    json_reply(&mut stream, "200 OK", json!({ "ok": true }));
+                } else {
+                    json_reply(&mut stream, "404 Not Found", json!({ "error": "no such capture request (timed out or already answered)" }));
+                }
+            }
             ("POST", "/mcp") => {
                 // DNS-rebinding guard (MCP spec): browsers send Origin; only accept local pages.
-                if let Some(origin) = req.header("origin") {
-                    let local = ["http://localhost", "http://127.0.0.1", "tauri://", "https://tauri.localhost"]
-                        .iter()
-                        .any(|p| origin.starts_with(p));
-                    if !local {
-                        return json_reply(&mut stream, "403 Forbidden", json!({ "error": "origin not allowed" }));
-                    }
+                if !req.local_origin() {
+                    return json_reply(&mut stream, "403 Forbidden", json!({ "error": "origin not allowed" }));
                 }
                 let (status, body) = crate::mcp::handle(&self, &req.body);
                 match body {
@@ -534,6 +640,17 @@ struct Request {
 impl Request {
     fn header(&self, name: &str) -> Option<&str> {
         self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+    }
+
+    /// No Origin (curl, MCP clients) or a page served from this machine / the app window.
+    fn local_origin(&self) -> bool {
+        // the host must end where the prefix ends, so "http://localhost.evil.com" doesn't pass
+        self.header("origin").is_none_or(|o| {
+            o.starts_with("tauri://")
+                || ["http://localhost", "http://127.0.0.1", "https://tauri.localhost"]
+                    .iter()
+                    .any(|p| o.strip_prefix(p).is_some_and(|rest| rest.is_empty() || rest.starts_with(':')))
+        })
     }
 }
 

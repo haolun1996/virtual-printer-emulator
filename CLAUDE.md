@@ -2,7 +2,7 @@
 
 ESC/POS virtual network printer: a Rust + Tauri v2 desktop app for macOS and Windows. It listens on TCP 9100, parses receipt-printer byte streams and shows each job live.
 The window is a webview showing `ui/index.html`, which is served by the app's own HTTP server (also reachable from a browser at `localhost:9101`).
-Keep dependencies minimal: `tauri`, `serde_json`, `encoding_rs`. The servers are plain `std::net` + threads (no tokio). The viewer is a single HTML file with no CDN scripts.
+Keep dependencies minimal: `tauri`, `serde_json`, `encoding_rs`. The servers are plain `std::net` + threads (no tokio). The viewer is a single HTML file with no CDN scripts (the one library, `html-to-image`, is pasted inline).
 
 ## Commands (run in `src-tauri/`)
 
@@ -27,17 +27,22 @@ The `LNK4099 … libcmt.amd64.pdb` linker warning is harmless.
   - `on_download` saves `download .bin` files to `~/Downloads`.
 - `src-tauri/src/server.rs`: two servers.
   - **Printer port** (one thread per connection, 100 ms read timeout) sniffs the first bytes. HTTP verbs are handled as HTTP (POST body = raw ESC/POS, CORS + Private-Network headers). Anything else is fed into one `Printer`.
-  - **Viewer** (127.0.0.1) serves `ui/index.html` (embedded with `include_str!`), SSE at `/events` (`init`, `receipt`, `log`, `status`, `clear`), the MCP endpoint `/mcp`, and `/api/receipts`, `/api/receipts/:id/raw`, `/api/clear`, `/api/test`, `/api/listen?port=`.
+  - **Viewer** (127.0.0.1) serves `ui/index.html` (embedded with `include_str!`), SSE at `/events` (`init`, `receipt`, `log`, `status`, `clear`, `capture`), the MCP endpoint `/mcp`, and `/api/receipts`, `/api/receipts/:id/raw`, `/api/clear`, `/api/test`, `/api/listen?port=`, `/api/capture`.
+  - **Receipt images** (`capture_receipt`): the server sends `capture {req, receipt}` over SSE. An open viewer (app window or browser tab) renders the paper to PNG pages and posts `{req, pages: [base64]}` or `{req, error}` to `/api/capture`. The first answer wins, with a 15 s timeout. PNGs go to `$TMPDIR/escpos-printer-<viewer port>/receipt-<id>[-pN].png`, and `clear_receipts` deletes that folder.
   - If the viewer port is busy, the app picks a free one. A busy printer port is **not** fatal: `status.listening = false`, and the UI shows a banner to start on another port.
 - `src-tauri/src/escpos.rs`: parser and printer model (`Printer`, `Receipt`, `Item`). Pure, no I/O. Output is `printer.events`: `Update` (receipt JSON; `raw` attached once done), `Log`, `Respond` (bytes back to the client).
 - `src-tauri/src/mcp.rs`: MCP server, so AI agents can read receipts.
   - Streamable HTTP at `POST /mcp` on the viewer server. Every request gets a plain JSON response; there is no server-initiated SSE stream, and `GET /mcp` returns 405. Requests with a non-local `Origin` get 403 (DNS-rebinding guard).
-  - Tools: `printer_status`, `list_receipts`, `get_receipt` (text/json/hex), `wait_for_receipt` (Condvar `latest_done` in `Shared`), `clear_receipts`.
+  - Tools: `printer_status`, `list_receipts`, `get_receipt` (text/json/hex/image), `wait_for_receipt` (Condvar `latest_done` in `Shared`), `clear_receipts`.
+  - `format=image` returns file paths, not image content: the client opens them with its own file reader. It needs an open viewer; in `--headless` mode with no browser tab it fails at once with a message.
   - `render_receipt` turns the receipt JSON into plain text on N columns.
   - `--mcp-stdio` (`run_stdio_bridge`) forwards newline-delimited JSON-RPC from stdin to the running app's `/mcp`.
 - `src-tauri/src/qr.rs`: QR encoder (byte mode, v1–40, L/M/Q/H, mask selection). `pack()` produces 1-bit rows.
 - `src-tauri/src/sample.rs`: the demo receipt behind the "Print test receipt" button.
 - `ui/index.html`: the viewer (inline CSS/JS). It renders the receipt JSON into DOM and canvas.
+  - `captureReceipt` draws a fresh off-screen copy of the paper at zoom 1 (1 px = 1 dot) with `html-to-image`, then splits it into pages of at most `PAGE_MAX` px at item boundaries.
+  - WebKit (the macOS window) leaves images out of the SVG snapshot, so the logo/QR `<canvas>` elements are hidden during the snapshot and painted on afterwards. Check image changes in the real window, not only in Chrome.
+  - The inlined `html-to-image` 1.11.13 has two local patches, described in the comment above it. Re-apply them if you upgrade it.
 - `src-tauri/icons/`: generated with `cargo tauri icon <1024px png>`. The source art isn't kept; mobile icon folders were deleted.
 
 ## Receipt JSON (contract between `escpos.rs` `to_json` and `renderItem()` in `ui/index.html`)
@@ -80,11 +85,14 @@ Put metadata in the `.meta` bar above the receipt, in tooltips or in the Activit
 - **End to end:** run `cargo run -- --headless --port 19100 --viewer-port 19101`, send jobs with `nc`/`curl`, then check `curl localhost:19101/api/receipts`.
 - **MCP:** POST JSON-RPC with curl (`initialize`, `tools/list`, `tools/call`). To test with a real client without touching the user's config, use `claude -p "<prompt>" --strict-mcp-config --mcp-config <tmp.json> --allowedTools "mcp__escpos__get_receipt"`. Put the prompt **before** `--allowedTools`, which takes several values.
 - **Visual:** `"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --headless=new --disable-gpu --user-data-dir=<tmp> --window-size=1100,900 --screenshot=<out.png> http://localhost:19101/`
+- **Receipt image (MCP `format=image`):** keep a viewer open while testing: a headless Chrome without `--screenshot` stays on the page. The WebKit path needs the real window (`cargo run -- --port 19200 --viewer-port 19201`).
 - **QR scannability:** decode a screenshot with a `swift` script: `CIDetector(ofType: CIDetectorTypeQRCode)` → `CIQRCodeFeature.messageString`.
 
 ## Gotchas
 
 - **Port 9100** is often taken on this machine. Flutter/Dart DevTools binds `127.0.0.1:9100`, and the user may also be running the old Node emulator on `*:9100`. When both are up, `localhost:9100` reaches DevTools while LAN connections reach the emulator. Don't kill the user's processes; test on 19100/19101.
 - The printer port binds `0.0.0.0` so LAN devices can print. The viewer binds `127.0.0.1` on purpose, because receipts may contain customer data.
+- Running the window with `--port` **overwrites the saved port** in `~/Library/Application Support/com.haolun.escpos-virtual-printer/settings.json`. Back it up and restore it after testing.
+- Old viewer tabs, such as a leftover headless Chrome, reconnect to `/events` but run the old page. They never answer `capture`, so `format=image` times out. Use other test ports.
 - `ui/index.html` is compiled into the binary, so UI changes need a rebuild (or `cargo run`).
 - The builds are unsigned (no Apple Developer ID or Windows code-signing certificate). The Windows build is cross-compiled and hasn't been run on a real Windows machine.

@@ -18,8 +18,8 @@ const MAX_HEX_BYTES: usize = 16 * 1024;
 
 const INSTRUCTIONS: &str = "Virtual ESC/POS receipt printer. Point-of-sale apps print to it over TCP port 9100 \
 (or the port shown by printer_status). Use list_receipts to see recent print jobs, get_receipt to read one \
-(plain text laid out like the paper, the structured JSON with styles, or a hex dump of the raw ESC/POS bytes), \
-and wait_for_receipt to block until the next job finishes printing. QR codes and barcodes are reported with \
+(plain text laid out like the paper, the structured JSON with styles, a hex dump of the raw ESC/POS bytes, \
+or format=image to get PNG files of the paper as the viewer draws it), and wait_for_receipt to block until the next job finishes printing. QR codes and barcodes are reported with \
 their encoded data.";
 
 fn tools() -> Value {
@@ -45,12 +45,12 @@ fn tools() -> Value {
         {
             "name": "get_receipt",
             "title": "Read a receipt",
-            "description": "Read one printed receipt (the latest if id is omitted). format=text (default) renders it as plain text laid out on the paper width, with images, barcodes and QR codes shown as [ ... ] lines that include their data. format=json returns the structured receipt with styles (bold, underline, double size, alignment, fonts). format=hex returns a hex dump of the raw ESC/POS bytes the app sent.",
+            "description": "Read one printed receipt (the latest if id is omitted). format=text (default) renders it as plain text laid out on the paper width, with images, barcodes and QR codes shown as [ ... ] lines that include their data. format=json returns the structured receipt with styles (bold, underline, double size, alignment, fonts). format=hex returns a hex dump of the raw ESC/POS bytes the app sent. format=image renders the paper exactly as the viewer shows it (fonts, logos, QR codes; 1 px = 1 printer dot) and returns the local path of each PNG file; open them with your file-reading tool to look at the receipt. Long receipts are split into several pages. Needs the app window (or the viewer in a browser) to be open.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "id": { "type": "integer", "description": "Receipt id from list_receipts. Omit for the latest." },
-                    "format": { "type": "string", "enum": ["text", "json", "hex"], "default": "text" },
+                    "format": { "type": "string", "enum": ["text", "json", "hex", "image"], "default": "text" },
                     "columns": { "type": "integer", "minimum": 16, "maximum": 96, "default": DEFAULT_COLUMNS,
                         "description": "Paper width in characters for format=text (80mm = 48, 58mm = 32)." }
                 },
@@ -185,6 +185,17 @@ fn call_tool(shared: &Arc<Shared>, name: &str, args: &Value) -> Result<String, T
                     Some(raw) => Ok(hex_dump(&raw)),
                     None => Err(ToolError::Failed(format!("Receipt #{id} is still printing; raw bytes are available once it is done."))),
                 },
+                "image" => {
+                    let paths = shared.capture_receipt(*id).map_err(ToolError::Failed)?;
+                    let mut out = format!("Receipt #{id} as {} PNG file(s){}:\n", paths.len(),
+                        if r["done"] == true { "" } else { " (still printing, so it may be incomplete)" });
+                    for p in &paths {
+                        let size = std::fs::read(p).ok().and_then(|b| png_size(&b)).map(|(w, h)| format!(" ({w}x{h} px)")).unwrap_or_default();
+                        out.push_str(&format!("{}{size}\n", p.display()));
+                    }
+                    out.push_str("1 px = 1 printer dot. Open the file(s) to see the receipt.");
+                    Ok(out)
+                }
                 _ => Ok(render_receipt(&r, columns)),
             }
         }
@@ -206,6 +217,13 @@ fn call_tool(shared: &Arc<Shared>, name: &str, args: &Value) -> Result<String, T
         }
         _ => Err(ToolError::Unknown),
     }
+}
+
+/// Width and height from a PNG's IHDR chunk.
+fn png_size(b: &[u8]) -> Option<(u32, u32)> {
+    let be = |o: usize| b.get(o..o + 4).map(|s| u32::from_be_bytes([s[0], s[1], s[2], s[3]]));
+    (b.get(12..16)? == b"IHDR").then_some(())?;
+    Some((be(16)?, be(20)?))
 }
 
 // ------------------------------------------------------------------ text rendering
